@@ -87,7 +87,7 @@ jobs:
           {
             echo "## Cloud render smoke test passed"
             echo
-            echo "- Rendered on a GitHub-hosted `ubuntu-latest` runner."
+            echo '- Rendered on a GitHub-hosted ubuntu-latest runner.'
             echo "- Output: 1280x720, 30 FPS, approximately 12 seconds."
             echo "- Includes H.264 video and AAC audio."
             echo "- FFprobe validation and SHA-256 checksum succeeded."
