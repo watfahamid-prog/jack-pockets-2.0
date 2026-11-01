@@ -21,17 +21,28 @@ from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 SENSITIVE_NAMES = {
-    ".env", ".env.local", ".env.production", "credentials.json", "secrets.json",
-    "id_rsa", "id_ed25519", "known_hosts", "gha-creds.json",
+    ".env", "credentials.json", "secrets.json", "id_rsa", "id_ed25519",
+    "known_hosts", "gha-creds.json",
 }
-SENSITIVE_GLOBS = ("*.pem", "*.key", "*.p12", "*.pfx", "*secret*", "*credential*", "*token*")
+SENSITIVE_GLOBS = (
+    ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "*.kdbx",
+    "*secret*", "*credential*", "*token*", "*private*",
+)
+SENSITIVE_DIRS = {".ssh", ".gnupg", "credentials", "secrets", "private", "certs"}
+SECRET_CONTENT_PATTERNS = (
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"(?i)\b(?:api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*['\"]?[^\s'\"]{8,}"),
+)
 
 
 def run(args: list[str], *, check: bool = True) -> str:
     proc = subprocess.run(args, cwd=ROOT, text=True, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT)
+                          stderr=subprocess.PIPE)
     if check and proc.returncode:
-        raise RuntimeError(f"{' '.join(args)} failed ({proc.returncode}):\n{proc.stdout.strip()}")
+        detail = "\n".join(part.strip() for part in (proc.stdout, proc.stderr) if part.strip())
+        raise RuntimeError(f"{' '.join(args)} failed ({proc.returncode}):\n{detail}")
     return proc.stdout.strip()
 
 
@@ -49,12 +60,16 @@ def normalize_slug(value: str) -> str:
 def changed_paths(base: str) -> set[str]:
     tracked = git("diff", "--name-only", "--no-renames", base, "--").splitlines()
     untracked = git("ls-files", "--others", "--exclude-standard").splitlines()
-    return {path for path in (*tracked, *untracked) if path}
+    paths = {path for path in (*tracked, *untracked) if path}
+    return {path for path in paths
+            if "__pycache__" not in PurePosixPath(path).parts and not path.endswith((".pyc", ".pyo"))}
 
 
 def path_is_sensitive(path: str) -> bool:
     name = PurePosixPath(path).name.lower()
-    return name in SENSITIVE_NAMES or any(fnmatch.fnmatch(name, pattern) for pattern in SENSITIVE_GLOBS)
+    parts = {part.lower() for part in PurePosixPath(path).parts[:-1]}
+    return (name in SENSITIVE_NAMES or bool(parts & SENSITIVE_DIRS)
+            or any(fnmatch.fnmatch(name, pattern) for pattern in SENSITIVE_GLOBS))
 
 
 def validate_path(value: str) -> str:
@@ -73,8 +88,24 @@ def is_deletion(path: str, base: str) -> bool:
 
 
 def require_review(paths: list[str], base: str) -> None:
-    flagged = [(path, "deletion" if is_deletion(path, base) else "sensitive filename")
-               for path in paths if is_deletion(path, base) or path_is_sensitive(path)]
+    flagged: list[tuple[str, str]] = []
+    for path in paths:
+        reasons = []
+        if is_deletion(path, base):
+            reasons.append("deletion")
+        if path_is_sensitive(path):
+            reasons.append("sensitive filename/path")
+        full = ROOT / Path(*PurePosixPath(path).parts)
+        if full.is_file() and not is_deletion(path, base):
+            try:
+                data = full.read_bytes()
+                text = data.decode("utf-8")
+                if any(pattern.search(text) for pattern in SECRET_CONTENT_PATTERNS):
+                    reasons.append("possible secret content")
+            except (UnicodeDecodeError, OSError):
+                pass
+        if reasons:
+            flagged.append((path, ", ".join(reasons)))
     if not flagged:
         return
     print("Explicit review required for potentially destructive/sensitive changes:")
@@ -90,7 +121,9 @@ def default_branch() -> str:
     symbolic = git("symbolic-ref", "refs/remotes/origin/HEAD", check=False)
     if symbolic.startswith("refs/remotes/origin/"):
         return symbolic.removeprefix("refs/remotes/origin/")
-    if git("show-ref", "--verify", "--quiet", "refs/remotes/origin/main", check=False) == "":
+    probe = subprocess.run(["git", "show-ref", "--verify", "--quiet", "refs/remotes/origin/main"],
+                           cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if probe.returncode == 0:
         return "main"
     raise RuntimeError("Cannot determine origin default branch; refusing to guess.")
 
@@ -131,21 +164,24 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError(f"Unexpected origin; refusing to push: {origin}")
     trunk = default_branch()
     current = git("branch", "--show-current")
-    if current != trunk and not current.startswith("codex/"):
-        raise RuntimeError(f"Current branch {current!r} is not a task branch or {trunk!r}.")
+    if not current:
+        raise RuntimeError("Detached HEAD; refusing to create a task branch.")
     branch = f"codex/{slug}-{dt.datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6]}"
     exists = subprocess.run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=ROOT)
     if exists.returncode == 0:
         raise RuntimeError(f"Generated branch already exists; refusing to reuse: {branch}")
-    if current == trunk:
-        git("switch", "-c", branch)
+    remote_branch = git("ls-remote", "--heads", "origin", f"refs/heads/{branch}")
+    if remote_branch:
+        raise RuntimeError(f"Generated remote branch already exists; refusing to reuse: {branch}")
+    git("switch", "-c", branch)
 
     git("add", "--", *paths)
     staged = set(git("diff", "--cached", "--name-only").splitlines())
     if staged != selected:
         raise RuntimeError("Staged set differs from task selection; stopping before commit.")
+    staged_diff = git("diff", "--cached", "--")
+    print("Staged patch for review:\n" + staged_diff, flush=True)
     require_review(paths, base)
-    print("Staged patch:\n" + git("diff", "--cached", "--"), flush=True)
     name = os.environ.get("GIT_AUTHOR_NAME") or git("log", "-1", "--format=%an")
     email = os.environ.get("GIT_AUTHOR_EMAIL") or git("log", "-1", "--format=%ae")
     git("-c", f"user.name={name}", "-c", f"user.email={email}", "commit", "-m",

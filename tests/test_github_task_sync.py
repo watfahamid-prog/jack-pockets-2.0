@@ -15,7 +15,8 @@ spec.loader.exec_module(sync)
 
 class SyncSafetyTests(unittest.TestCase):
     def test_sensitive_names_are_flagged(self) -> None:
-        for path in (".env", "config/prod.pem", "secrets.json", "api-token.txt"):
+        for path in (".env", ".env.test", "config/prod.pem", "secrets.json",
+                     "api-token.txt", ".ssh/config", "private/notes.txt"):
             with self.subTest(path=path):
                 self.assertTrue(sync.path_is_sensitive(path))
 
