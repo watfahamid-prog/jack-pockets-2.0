@@ -20,6 +20,16 @@ class SyncSafetyTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(sync.path_is_sensitive(path))
 
+    def test_secret_content_is_detected_for_review(self) -> None:
+        from unittest.mock import patch
+        with patch.object(sync, "is_deletion", return_value=False), \
+             patch.object(sync, "path_is_sensitive", return_value=False), \
+             patch.object(sync.Path, "is_file", return_value=True), \
+             patch.object(sync.Path, "read_bytes", return_value=b"api_" + b"key=example-super-secret-value"):
+            with patch.object(sync.sys.stdin, "isatty", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "Interactive review"):
+                    sync.require_review(["src/config.py"], "HEAD")
+
     def test_ordinary_source_files_are_not_flagged(self) -> None:
         self.assertFalse(sync.path_is_sensitive("src/feature.py"))
         self.assertFalse(sync.path_is_sensitive("docs/WORKFLOW.md"))
